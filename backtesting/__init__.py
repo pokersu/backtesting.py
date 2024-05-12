@@ -60,3 +60,7 @@ except ImportError:
 from . import lib  # noqa: F401
 from ._plotting import set_bokeh_output  # noqa: F401
 from .backtesting import Backtest, Strategy  # noqa: F401
+
+
+from ._okx import _get_candles as okx_get_candles
+from ._okx import _get_history_candles as okx_get_history_candles

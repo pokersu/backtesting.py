@@ -1,2 +1,3 @@
 # To run example notebooks, install required and test dependencies
 .[test]
+bokeh==2.4.3

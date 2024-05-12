@@ -274,7 +274,7 @@ class Strategy(metaclass=ABCMeta):
     @property
     def orders(self) -> 'Tuple[Order, ...]':
         """List of orders (see `Order`) waiting for execution."""
-        return _Orders(self._broker.orders)
+        return tuple(self._broker.orders)
 
     @property
     def trades(self) -> 'Tuple[Trade, ...]':
@@ -285,27 +285,6 @@ class Strategy(metaclass=ABCMeta):
     def closed_trades(self) -> 'Tuple[Trade, ...]':
         """List of settled trades (see `Trade`)."""
         return tuple(self._broker.closed_trades)
-
-
-class _Orders(tuple):
-    """
-    TODO: remove this class. Only for deprecation.
-    """
-    def cancel(self):
-        """Cancel all non-contingent (i.e. SL/TP) orders."""
-        for order in self:
-            if not order.is_contingent:
-                order.cancel()
-
-    def __getattr__(self, item):
-        # TODO: Warn on deprecations from the previous version. Remove in the next.
-        removed_attrs = ('entry', 'set_entry', 'is_long', 'is_short',
-                         'sl', 'tp', 'set_sl', 'set_tp')
-        if item in removed_attrs:
-            raise AttributeError(f'Strategy.orders.{"/.".join(removed_attrs)} were removed in'
-                                 'Backtesting 0.2.0. '
-                                 'Use `Order` API instead. See docs.')
-        raise AttributeError(f"'tuple' object has no attribute {item!r}")
 
 
 class Position:
@@ -577,6 +556,11 @@ class Trade:
         return self.__exit_price
 
     @property
+    def commission(self) -> Optional[float]:
+        """Trade commission. use by entry price"""
+        return self.__broker.calc_commission(self.__size, self.__entry_price)
+
+    @property
     def entry_bar(self) -> int:
         """Candlestick bar index of when the trade was entered."""
         return self.__entry_bar
@@ -636,21 +620,20 @@ class Trade:
 
     @property
     def pl(self):
-        """Trade profit (positive) or loss (negative) in cash units."""
+        """Trade profit (positive) or loss (negative) in cash units. 使用合约面值计算而非价格, 合约面值=价格x合约乘数"""
         price = self.__exit_price or self.__broker.last_price
-        return self.__size * (price - self.__entry_price)
+        ct_par_val = self.__broker.ct_par_val(price)
+        entry_ct_par_val = self.__broker.ct_par_val(self.__entry_price)
+        return self.__size * (ct_par_val - entry_ct_par_val)
 
     @property
     def pl_pct(self):
         """Trade profit (positive) or loss (negative) in percent."""
         price = self.__exit_price or self.__broker.last_price
-        return copysign(1, self.__size) * (price / self.__entry_price - 1)
+        ct_par_val = self.__broker.ct_par_val(price)
+        entry_ct_par_val = self.__broker.ct_par_val(self.__entry_price)
+        return copysign(1, self.__size) * (ct_par_val / entry_ct_par_val - 1)
 
-    @property
-    def value(self):
-        """Trade total value in cash (volume × price)."""
-        price = self.__exit_price or self.__broker.last_price
-        return abs(self.__size) * price
 
     # SL/TP management API
 
@@ -698,16 +681,18 @@ class Trade:
 
 
 class _Broker:
-    def __init__(self, *, data, cash, commission, margin,
+    def __init__(self, *, data, cash, commission, margin, ct_mult,
                  trade_on_close, hedging, exclusive_orders, index):
         assert 0 < cash, f"cash should be >0, is {cash}"
         assert -.1 <= commission < .1, \
             ("commission should be between -10% "
              f"(e.g. market-maker's rebates) and 10% (fees), is {commission}")
         assert 0 < margin <= 1, f"margin should be between 0 and 1, is {margin}"
+        assert 0 < ct_mult <= 1, f"ct mult should be between 0 and 1, is {ct_mult}"
         self._data: _Data = data
         self._cash = cash
         self._commission = commission
+        self._ct_mult = ct_mult
         self._leverage = 1 / margin
         self._trade_on_close = trade_on_close
         self._hedging = hedging
@@ -741,18 +726,19 @@ class _Broker:
         tp = tp and float(tp)
 
         is_long = size > 0
-        adjusted_price = self._adjusted_price(size)
+        price = self.last_price
 
         if is_long:
-            if not (sl or -np.inf) < (limit or stop or adjusted_price) < (tp or np.inf):
+            # if not (sl or -np.inf) < (limit or stop or adjusted_price) < (tp or np.inf):
+            if not (sl or -np.inf) < (limit or stop or price) < (tp or np.inf):
                 raise ValueError(
                     "Long orders require: "
-                    f"SL ({sl}) < LIMIT ({limit or stop or adjusted_price}) < TP ({tp})")
+                    f"SL ({sl}) < LIMIT ({limit or stop or price}) < TP ({tp})")
         else:
-            if not (tp or -np.inf) < (limit or stop or adjusted_price) < (sl or np.inf):
+            if not (tp or -np.inf) < (limit or stop or price) < (sl or np.inf):
                 raise ValueError(
                     "Short orders require: "
-                    f"TP ({tp}) < LIMIT ({limit or stop or adjusted_price}) < SL ({sl})")
+                    f"TP ({tp}) < LIMIT ({limit or stop or price}) < SL ({sl})")
 
         order = Order(self, size, limit, stop, sl, tp, trade, tag)
         # Put the new order in the order queue,
@@ -778,12 +764,12 @@ class _Broker:
         """ Price at the last (current) close. """
         return self._data.Close[-1]
 
-    def _adjusted_price(self, size=None, price=None) -> float:
-        """
-        Long/short `price`, adjusted for commisions.
-        In long positions, the adjusted price is a fraction higher, and vice versa.
-        """
-        return (price or self.last_price) * (1 + copysign(self._commission, size))
+    def ct_par_val(self, price=None) -> float:
+        return (price or self.last_price) * self._ct_mult
+
+    def calc_commission(self, size, price=None) -> float:
+        return self._commission * self.ct_par_val(price) * size
+
 
     @property
     def equity(self) -> float:
@@ -791,8 +777,7 @@ class _Broker:
 
     @property
     def margin_available(self) -> float:
-        # From https://github.com/QuantConnect/Lean/pull/3768
-        margin_used = sum(trade.value / self._leverage for trade in self.trades)
+        margin_used = sum(self.ct_par_val(trade.entry_price) * trade.size / self._leverage for trade in self.trades)
         return max(0, self.equity - margin_used)
 
     def next(self):
@@ -889,14 +874,13 @@ class _Broker:
 
             # Adjust price to include commission (or bid-ask spread).
             # In long positions, the adjusted price is a fraction higher, and vice versa.
-            adjusted_price = self._adjusted_price(order.size, price)
+            ct_par_val = self.ct_par_val(price)
 
             # If order size was specified proportionally,
             # precompute true size in units, accounting for margin and spread/commissions
             size = order.size
             if -1 < size < 1:
-                size = copysign(int((self.margin_available * self._leverage * abs(size))
-                                    // adjusted_price), size)
+                size = copysign(int(self.margin_available * self._leverage // (ct_par_val * abs(size))), size)
                 # Not enough cash/margin even for a single unit
                 if not size:
                     self.orders.remove(order)
@@ -928,13 +912,13 @@ class _Broker:
                         break
 
             # If we don't have enough liquidity to cover for the order, cancel it
-            if abs(need_size) * adjusted_price > self.margin_available * self._leverage:
+            if abs(need_size) * ct_par_val > self.margin_available * self._leverage:
                 self.orders.remove(order)
                 continue
 
             # Open a new trade
             if need_size:
-                self._open_trade(adjusted_price,
+                self._open_trade(price,
                                  need_size,
                                  order.sl,
                                  order.tp,
@@ -999,7 +983,9 @@ class _Broker:
 
     def _open_trade(self, price: float, size: int,
                     sl: Optional[float], tp: Optional[float], time_index: int, tag):
+        # commission = self._commission * self.ct_par_val(price) * size
         trade = Trade(self, size, price, time_index, tag)
+        self._cash -= trade.commission
         self.trades.append(trade)
         # Create SL/TP (bracket) orders.
         # Make sure SL order is created first so it gets adversarially processed before TP order
@@ -1021,6 +1007,7 @@ class Backtest:
     instance, or `backtesting.backtesting.Backtest.optimize` to
     optimize it.
     """
+
     def __init__(self,
                  data: pd.DataFrame,
                  strategy: Type[Strategy],
@@ -1028,6 +1015,7 @@ class Backtest:
                  cash: float = 10_000,
                  commission: float = .0,
                  margin: float = 1.,
+                 ct_mult: float = 1.,
                  trade_on_close=False,
                  hedging=False,
                  exclusive_orders=False
@@ -1127,7 +1115,7 @@ class Backtest:
 
         self._data: pd.DataFrame = data
         self._broker = partial(
-            _Broker, cash=cash, commission=commission, margin=margin,
+            _Broker, cash=cash, commission=commission, margin=margin, ct_mult=ct_mult,
             trade_on_close=trade_on_close, hedging=hedging,
             exclusive_orders=exclusive_orders, index=data.index,
         )
